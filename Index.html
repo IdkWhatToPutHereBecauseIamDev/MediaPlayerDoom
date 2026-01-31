@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Doom Media Controls Raycaster</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0f0;
+      font-family: monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    #view {
+      border: 2px solid #0f0;
+      image-rendering: pixelated;
+      background: #000;
+    }
+    #hud {
+      margin-top: 8px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="view" width="240" height="160"></canvas>
+  <div id="hud">
+    <div>Score: <span id="score">0</span> | High Score: <span id="highscore">0</span></div>
+    <div>Prev = turn left, Play/Pause = forward + shoot, Next = turn right</div>
+  </div>
+
+  <audio id="silent" loop></audio>
+
+  <!-- CONFIG + GLOBALS -->
+  <script>
+    const canvas = document.getElementById('view');
+    const ctx = canvas.getContext('2d');
+
+    // 1 = wall, 0 = empty
+    const map = [
+      [1,1,1,1,1,1,1,1,1,1,1,1],
+      [1,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,0,0,1,1,1,0,0,0,0,1],
+      [1,0,0,0,1,0,1,0,0,0,0,1],
+      [1,0,0,0,1,0,1,0,0,0,0,1],
+      [1,0,0,0,1,1,1,0,0,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,1],
+      [1,1,1,1,1,1,1,1,1,1,1,1],
+    ];
+    const mapW = map[0].length;
+    const mapH = map.length;
+
+    let px = 2.5;
+    let py = 2.5;
+    let dir = 0;
+    const fov = Math.PI / 3;
+    const moveSpeed = 0.2;
+    const rotSpeed = Math.PI / 18;
+
+    let score = 0;
+    let highScore = 0;
+
+    const scoreSpan = document.getElementById('score');
+    const highSpan = document.getElementById('highscore');
+
+    // Enemies: simple sprites in the map
+    let enemies = [
+      { x: 6.5, y: 3.5, alive: true },
+      { x: 8.5, y: 6.5, alive: true },
+      { x: 4.5, y: 7.5, alive: true }
+    ];
+
+    function isWall(x, y) {
+      const mx = Math.floor(x);
+      const my = Math.floor(y);
+      if (mx < 0 || my < 0 || mx >= mapW || my >= mapH) return true;
+      return map[my][mx] === 1;
+    }
+  </script>
+
+  <!-- MEDIA SESSION + AUDIO -->
+  <script>
+    let mediaAudio = null;
+
+    function updateScoreMeta() {
+      scoreSpan.textContent = score;
+      highSpan.textContent = highScore;
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: `Score: ${score}`,
+          artist: '',
+          album: `High Score: ${highScore}`,
+          artwork: []
+        });
+      }
+    }
+
+    function setupMediaSession(handlers) {
+      if (!('mediaSession' in navigator)) return;
+
+      navigator.mediaSession.setActionHandler('play', () => {
+        handlers.forward();
+      });
+      navigator.mediaSession.setActionHandler('pause', () => {
+        handlers.forward();
+      });
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        handlers.left();
+      });
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        handlers.right();
+      });
+
+      updateScoreMeta();
+    }
+
+    function startSilentAudio() {
+      mediaAudio = document.getElementById('silent');
+      // 1-second silent WAV
+      mediaAudio.src =
+        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
+      mediaAudio.play().catch(() => {
+        document.body.addEventListener('click', () => {
+          mediaAudio.play().catch(() => {});
+        }, { once: true });
+      });
+
+      mediaAudio.onplay = () => {
+        updateScoreMeta();
+      };
+    }
+  </script>
+
+  <!-- GAME + RAYCASTER + ENEMIES + GUN -->
+  <script>
+    function render() {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      // Sky
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, h / 2);
+      skyGrad.addColorStop(0, '#001000');
+      skyGrad.addColorStop(1, '#003000');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, w, h / 2);
+
+      // Floor
+      const floorGrad = ctx.createLinearGradient(0, h / 2, 0, h);
+      floorGrad.addColorStop(0, '#001000');
+      floorGrad.addColorStop(1, '#000000');
+      ctx.fillStyle = floorGrad;
+      ctx.fillRect(0, h / 2, w, h / 2);
+
+      // Raycast walls
+      const zBuffer = new Array(w);
+
+      for (let x = 0; x < w; x++) {
+        const cameraX = 2 * x / w - 1;
+        const rayDirX = Math.cos(dir) + cameraX * Math.cos(dir + Math.PI / 2);
+        const rayDirY = Math.sin(dir) + cameraX * Math.sin(dir + Math.PI / 2);
+
+        let mapX = Math.floor(px);
+        let mapY = Math.floor(py);
+
+        const deltaDistX = rayDirX === 0 ? 1e30 : Math.abs(1 / rayDirX);
+        const deltaDistY = rayDirY === 0 ? 1e30 : Math.abs(1 / rayDirY);
+
+        let stepX, stepY;
+        let sideDistX, sideDistY;
+
+        if (rayDirX < 0) {
+          stepX = -1;
+          sideDistX = (px - mapX) * deltaDistX;
+        } else {
+          stepX = 1;
+          sideDistX = (mapX + 1.0 - px) * deltaDistX;
+        }
+
+        if (rayDirY < 0) {
+          stepY = -1;
+          sideDistY = (py - mapY) * deltaDistY;
+        } else {
+          stepY = 1;
+          sideDistY = (mapY + 1.0 - py) * deltaDistY;
+        }
+
+        let hit = 0;
+        let side = 0;
+
+        while (hit === 0) {
+          if (sideDistX < sideDistY) {
+            sideDistX += deltaDistX;
+            mapX += stepX;
+            side = 0;
+          } else {
+            sideDistY += deltaDistY;
+            mapY += stepY;
+            side = 1;
+          }
+          if (mapY < 0 || mapY >= mapH || mapX < 0 || mapX >= mapW || map[mapY][mapX] === 1) {
+            hit = 1;
+          }
+        }
+
+        let perpWallDist;
+        if (side === 0) {
+          perpWallDist = (mapX - px + (1 - stepX) / 2) / rayDirX;
+        } else {
+          perpWallDist = (mapY - py + (1 - stepY) / 2) / rayDirY;
+        }
+
+        if (perpWallDist <= 0) perpWallDist = 0.01;
+        zBuffer[x] = perpWallDist;
+
+        const lineHeight = Math.floor(h / perpWallDist);
+        let drawStart = -lineHeight / 2 + h / 2;
+        let drawEnd = lineHeight / 2 + h / 2;
+        if (drawStart < 0) drawStart = 0;
+        if (drawEnd >= h) drawEnd = h - 1;
+
+        let shade = Math.max(0, 255 - perpWallDist * 40);
+        if (side === 1) shade *= 0.7;
+        shade = shade | 0;
+        ctx.fillStyle = `rgb(0,${shade},0)`;
+        ctx.fillRect(x, drawStart, 1, drawEnd - drawStart);
+      }
+
+      // Render enemies as sprites (simple billboards)
+      const visibleEnemies = [];
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const dx = e.x - px;
+        const dy = e.y - py;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const angleToEnemy = Math.atan2(dy, dx) - dir;
+
+        // Normalize angle to [-PI, PI]
+        let a = angleToEnemy;
+        while (a < -Math.PI) a += 2 * Math.PI;
+        while (a > Math.PI) a -= 2 * Math.PI;
+
+        const halfFov = fov / 2;
+        if (a < -halfFov || a > halfFov) continue;
+
+        const screenX = (0.5 + (a / fov)) * canvas.width;
+        const size = Math.min(canvas.height, (canvas.height / dist) * 0.8);
+
+        visibleEnemies.push({ e, dist, screenX, size });
+      }
+
+      // Painter's algorithm: far to near
+      visibleEnemies.sort((a, b) => b.dist - a.dist);
+
+      for (const v of visibleEnemies) {
+        const half = v.size / 2;
+        const xStart = Math.floor(v.screenX - half);
+        const xEnd = Math.floor(v.screenX + half);
+        const yStart = Math.floor(canvas.height / 2 - v.size);
+        const yEnd = Math.floor(canvas.height / 2 + v.size * 0.1);
+
+        ctx.fillStyle = '#800000';
+        for (let x = xStart; x < xEnd; x++) {
+          if (x < 0 || x >= canvas.width) continue;
+          if (v.dist > zBuffer[x]) continue; // behind wall
+          ctx.fillRect(x, yStart, 1, yEnd - yStart);
+        }
+      }
+
+      // Gun sprite at bottom center
+      const gunWidth = canvas.width * 0.35;
+      const gunHeight = canvas.height * 0.35;
+      const gx = (canvas.width - gunWidth) / 2;
+      const gy = canvas.height - gunHeight;
+
+      ctx.fillStyle = '#202020';
+      ctx.fillRect(gx, gy, gunWidth, gunHeight);
+      ctx.fillStyle = '#808080';
+      ctx.fillRect(gx + gunWidth * 0.2, gy + gunHeight * 0.3, gunWidth * 0.6, gunHeight * 0.5);
+      ctx.fillStyle = '#ff0000';
+      ctx.fillRect(gx + gunWidth * 0.45, gy + gunHeight * 0.1, gunWidth * 0.1, gunHeight * 0.3);
+    }
+
+    function shoot() {
+      // Auto-fire straight ahead: kill enemy in crosshair if close and centered
+      let best = null;
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const dx = e.x - px;
+        const dy = e.y - py;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const angleToEnemy = Math.atan2(dy, dx) - dir;
+
+        let a = angleToEnemy;
+        while (a < -Math.PI) a += 2 * Math.PI;
+        while (a > Math.PI) a -= 2 * Math.PI;
+
+        const aimThreshold = fov * 0.15; // narrow cone
+        if (Math.abs(a) < aimThreshold && dist < 8) {
+          if (!best || dist < best.dist) {
+            best = { e, dist };
+          }
+        }
+      }
+
+      if (best) {
+        best.e.alive = false;
+        score += 5; // bonus for kill
+        if (score > highScore) highScore = score;
+        updateScoreMeta();
+      }
+    }
+
+    function moveForward() {
+      const nx = px + Math.cos(dir) * moveSpeed;
+      const ny = py + Math.sin(dir) * moveSpeed;
+
+      if (!isWall(nx, ny)) {
+        px = nx;
+        py = ny;
+        score++;
+        if (score > highScore) highScore = score;
+      } else {
+        // Hit wall: reset score and respawn enemies
+        score = 0;
+        enemies.forEach(e => e.alive = true);
+      }
+      shoot(); // moving forward also fires
+      updateScoreMeta();
+      render();
+    }
+
+    function turnLeft() {
+      dir -= rotSpeed;
+      render();
+    }
+
+    function turnRight() {
+      dir += rotSpeed;
+      render();
+    }
+
+    // Init
+    render();
+    startSilentAudio();
+    setupMediaSession({
+      forward: moveForward,
+      left: turnLeft,
+      right: turnRight
+    });
+  </script>
+</body>
+</html>
